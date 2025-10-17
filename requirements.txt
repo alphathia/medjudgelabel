@@ -1,0 +1,16 @@
+# MedJudge-Labels Dependencies
+
+# OpenAI API
+openai>=2.0.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# JSON Schema validation
+jsonschema>=4.20.0
+
+# Already in venv (inherited from medical-safety/)
+pandas>=2.0.0
+huggingface-hub>=0.35.0
+inquirerpy>=0.3.0
+PyYAML>=6.0.0
