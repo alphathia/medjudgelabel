@@ -65,12 +65,14 @@ References:
 - Schema: PRD §2.3
 - Prompts: prompts/medjudge_system.txt, prompts/medjudge_unified_with_original.txt
 - Validator: scripts/validator.py
+- Prompts setup: https://arxiv.org/html/2403.03744v4#S3.T1
 """
 
 import argparse
 import csv
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
@@ -90,6 +92,32 @@ except ImportError as e:
     print(f"Error: Missing required dependency: {e}")
     print("Please install dependencies: pip install openai python-dotenv jsonschema")
     sys.exit(1)
+
+# Configure error logging for annotation failures
+ERROR_LOG_FILE = None  # Will be set in main() after output_dir is determined
+
+def setup_error_logging(output_dir: Path):
+    """Configure error logging for invalid/failed annotations."""
+    global ERROR_LOG_FILE
+    ERROR_LOG_FILE = output_dir / "annotation_errors.log"
+
+    error_logger = logging.getLogger("annotation_errors")
+    error_logger.setLevel(logging.INFO)
+
+    # Clear existing handlers to avoid duplicates
+    error_logger.handlers.clear()
+
+    # File handler for error details
+    fh = logging.FileHandler(ERROR_LOG_FILE, mode='a')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    error_logger.addHandler(fh)
+    error_logger.propagate = False
+
+    return error_logger
 
 
 class MedSafetyAnnotator:
@@ -539,6 +567,34 @@ class MedSafetyAnnotator:
             # Include original data and human labels for consistent structure
             # Per PRD §1.2: "up to 2 on schema violation; else log to invalid.jsonl"
             self.stats["invalid"] += 1
+
+            # Log detailed error information for debugging
+            error_logger = logging.getLogger("annotation_errors")
+            error_logger.info(f"=" * 80)
+            error_logger.info(f"VALIDATION ERROR - Row ID: {row_id}")
+            error_logger.info(f"Error Type: {type(e).__name__}")
+            error_logger.info(f"Error Message: {str(e)}")
+            error_logger.info(f"-" * 80)
+            error_logger.info(f"Query ({len(query)} chars): {query[:200]}{'...' if len(query) > 200 else ''}")
+            error_logger.info(f"Response ({len(response)} chars): {repr(response)}")
+            error_logger.info(f"-" * 80)
+
+            # If validation error, try to extract evidence details from raw response
+            if isinstance(e, ValidationError) and "Evidence span" in str(e):
+                try:
+                    parsed = json.loads(raw_response)
+                    if "response_labels" in parsed and "evidence" in parsed["response_labels"]:
+                        error_logger.info(f"LLM Evidence Details:")
+                        for idx, ev in enumerate(parsed["response_labels"]["evidence"]):
+                            error_logger.info(f"  Span {idx}: start={ev.get('start_char')}, end={ev.get('end_char')}")
+                            error_logger.info(f"    Quote: {repr(ev.get('quote', '')[:100])}")
+                except:
+                    pass  # If we can't parse, skip evidence details
+
+            error_logger.info(f"Raw LLM Response: {raw_response[:500]}{'...' if len(raw_response) > 500 else ''}")
+            error_logger.info(f"=" * 80)
+            error_logger.info("")
+
             return {
                 "status": "invalid",
                 "original": original_data,
@@ -782,6 +838,9 @@ class MedSafetyAnnotator:
         print(f"Rows:   {num_rows if num_rows else 'all'}")
         print(f"{'='*60}\n")
 
+        # Track invalid records for detailed reporting in run log
+        invalid_records = []
+
         # Open input CSV and output files (JSONL + CSV)
         # Using context managers (with statements) ensures files are properly closed
         with open(input_csv, newline="", encoding="utf-8") as f_in, \
@@ -832,6 +891,13 @@ class MedSafetyAnnotator:
                         }
                     }
 
+                    # Track invalid record for run log
+                    invalid_records.append({
+                        "row": idx,
+                        "id": result["original"]["id"],
+                        "error": result["error"]
+                    })
+
                     # Print error message (truncate to 50 chars for readability)
                     print(f"✗ {result['status'].capitalize()}: {result['error'][:50]}...")
 
@@ -844,12 +910,12 @@ class MedSafetyAnnotator:
                 csv_writer.writerow(csv_row)
 
         # Write execution log after processing completes
-        self._write_log(log_file, input_csv, num_rows)
+        self._write_log(log_file, input_csv, num_rows, invalid_records)
 
         # Print summary statistics to console
         self._print_summary()
 
-    def _write_log(self, log_file: Path, input_csv: Path, num_rows: Optional[int]):
+    def _write_log(self, log_file: Path, input_csv: Path, num_rows: Optional[int], invalid_records: list):
         """
         Write execution log in Markdown format.
 
@@ -921,7 +987,20 @@ class MedSafetyAnnotator:
   - Arrays (harm_types, hil_triggers) joined with semicolons
   - Easy to filter and sort in Excel/Google Sheets
 - **run_log.md**: This file
+- **validation_debug.log**: Detailed validation logs (evidence matching strategies, auto-corrections)
+- **annotation_errors.log**: Detailed error logs for invalid/failed annotations
+
+## Invalid Records
 """
+        # Add invalid records section if there are any
+        if invalid_records:
+            log_content += f"\n{len(invalid_records)} record(s) failed validation:\n\n"
+            for rec in invalid_records:
+                log_content += f"- **Row {rec['row']}** (ID: `{rec['id']}`): {rec['error']}\n"
+            log_content += f"\nSee `annotation_errors.log` for detailed error information.\n"
+        else:
+            log_content += "\n✓ All records validated successfully!\n"
+
         # Write log to disk (overwrites if exists)
         log_file.write_text(log_content)
 
@@ -1092,11 +1171,18 @@ def main():
         print(f"Error: Input file not found: {input_path}")
         sys.exit(1)
 
+    # Setup output directory and logging
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize error logging
+    setup_error_logging(output_dir)
+
     # Create annotator and run pipeline
     annotator = MedSafetyAnnotator(model_id=model_id, api_key=api_key)
     annotator.process_dataset(
         input_csv=input_path,
-        output_dir=Path(args.output),
+        output_dir=output_dir,
         num_rows=num_rows
     )
 

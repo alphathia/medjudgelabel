@@ -4,7 +4,30 @@ Validates structure and logical consistency per PRD §2.3 and §1.5.
 """
 
 import jsonschema
+import logging
+from pathlib import Path
 from typing import Dict, Any, List
+
+# Configure logging for validation debugging
+LOG_DIR = Path("artifacts")
+LOG_DIR.mkdir(exist_ok=True)
+VALIDATION_LOG_FILE = LOG_DIR / "validation_debug.log"
+
+# Create logger
+logger = logging.getLogger("validator")
+logger.setLevel(logging.DEBUG)
+
+# File handler for detailed validation logs
+fh = logging.FileHandler(VALIDATION_LOG_FILE, mode='a')
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+logger.addHandler(fh)
+
+# Prevent propagation to root logger (avoid duplicate console output)
+logger.propagate = False
 
 
 # JSON Schema from PRD §2.3
@@ -126,25 +149,42 @@ def validate_logical_consistency(obj: Dict[str, Any]) -> None:
     # Rule 3: Evidence span validation
     original_response = obj.get("original", {}).get("response", "")
     response_length = len(original_response)
+    record_id = obj.get("original", {}).get("id", "unknown")
+
+    logger.debug(f"[{record_id}] Starting evidence validation for {len(evidence)} span(s)")
+    logger.debug(f"[{record_id}] Response length: {response_length} chars")
 
     for idx, ev in enumerate(evidence):
         start = ev.get("start_char", 0)
         end = ev.get("end_char", 0)
         quote = ev.get("quote", "")
 
+        logger.debug(f"[{record_id}] Evidence span {idx}: start={start}, end={end}, quote_len={len(quote)}")
+        logger.debug(f"[{record_id}]   Quote: {repr(quote[:80])}{'...' if len(quote) > 80 else ''}")
+
         if start >= end:
             raise ValidationError(f"Evidence span {idx}: start_char ({start}) must be < end_char ({end})")
 
-        if end > response_length:
-            raise ValidationError(f"Evidence span {idx}: end_char ({end}) exceeds response length ({response_length})")
+        # Clamp end to valid Python slice range for safety when extracting actual_text
+        # We don't reject based on boundaries - let the 5-strategy search validate the quote
+        # This handles cases where LLM gives completely wrong offsets (e.g., off by 10+ chars)
+        clamped_end = min(end, response_length)
+        clamped_start = min(start, response_length)
 
-        # Verify and auto-correct quote character positions
-        # This handles LLM counting errors and wrong offset calculations
-        actual_text = original_response[start:end]
+        if end > response_length:
+            logger.debug(f"[{record_id}]   WARNING: end_char ({end}) exceeds response length ({response_length}) by {end - response_length} chars")
+            logger.debug(f"[{record_id}]   Clamping to [{clamped_start}:{clamped_end}] for extraction")
+
+        # Extract text at the LLM's claimed position (may be gibberish if offsets wrong)
+        actual_text = original_response[clamped_start:clamped_end]
+        logger.debug(f"[{record_id}]   Actual text at claimed position: {repr(actual_text[:50])}{'...' if len(actual_text) > 50 else ''}")
 
         # Strategy 1: Try exact match at given positions
         if actual_text == quote:
+            logger.debug(f"[{record_id}]   ✓ Strategy 1 SUCCESS: Exact match at given positions")
             continue  # Perfect match, no correction needed
+
+        logger.debug(f"[{record_id}]   ✗ Strategy 1 FAILED: No exact match")
 
         # Strategy 2: Try fuzzy match for small counting errors (±2 chars)
         is_fuzzy_match = (
@@ -153,16 +193,23 @@ def validate_logical_consistency(obj: Dict[str, Any]) -> None:
         )
 
         if is_fuzzy_match:
+            logger.debug(f"[{record_id}]   ✓ Strategy 2 SUCCESS: Fuzzy match (quote subset of actual or vice versa)")
             continue  # Close enough, accept as-is
+
+        logger.debug(f"[{record_id}]   ✗ Strategy 2 FAILED: No fuzzy match")
 
         # Strategy 3: Search for quote in entire response (auto-correct offsets)
         # This handles cases where LLM gave completely wrong start position
         found_idx = original_response.find(quote)
         if found_idx >= 0:
             # Found exact quote! Update the evidence span with correct positions
+            logger.debug(f"[{record_id}]   ✓ Strategy 3 SUCCESS: Found exact quote at index {found_idx}")
+            logger.debug(f"[{record_id}]   Auto-correcting offsets from [{start}:{end}] to [{found_idx}:{found_idx + len(quote)}]")
             ev["start_char"] = found_idx
             ev["end_char"] = found_idx + len(quote)
             continue  # Corrected successfully
+
+        logger.debug(f"[{record_id}]   ✗ Strategy 3 FAILED: Quote not found in response")
 
         # Strategy 4: Try finding first 80 characters of quote (handles truncation)
         # This is useful when LLM's quote was slightly modified or truncated
@@ -171,22 +218,34 @@ def validate_logical_consistency(obj: Dict[str, Any]) -> None:
             prefix_idx = original_response.find(search_prefix)
             if prefix_idx >= 0:
                 # Found the prefix! Accept this as valid and correct the position
+                logger.debug(f"[{record_id}]   ✓ Strategy 4 SUCCESS: Found first {len(search_prefix)} chars at index {prefix_idx}")
+                logger.debug(f"[{record_id}]   Auto-correcting offsets from [{start}:{end}] to [{prefix_idx}:{prefix_idx + len(quote)}]")
                 ev["start_char"] = prefix_idx
                 ev["end_char"] = prefix_idx + len(quote)
                 # Note: end_char might extend beyond actual text, but that's acceptable
                 # since we verified the key content (first 80 chars) exists
                 continue
 
+        logger.debug(f"[{record_id}]   ✗ Strategy 4 FAILED: First 80 chars not found")
+
         # Strategy 5: Case-insensitive search (handles capitalization differences)
         found_idx_lower = original_response.lower().find(quote.lower())
         if found_idx_lower >= 0:
             # Found with case-insensitive match
+            logger.debug(f"[{record_id}]   ✓ Strategy 5 SUCCESS: Case-insensitive match at index {found_idx_lower}")
+            logger.debug(f"[{record_id}]   Auto-correcting offsets from [{start}:{end}] to [{found_idx_lower}:{found_idx_lower + len(quote)}]")
             ev["start_char"] = found_idx_lower
             ev["end_char"] = found_idx_lower + len(quote)
             continue
 
+        logger.debug(f"[{record_id}]   ✗ Strategy 5 FAILED: Case-insensitive search failed")
+
         # If we get here, none of the strategies worked
         # This is likely a genuine hallucination where LLM made up a quote
+        logger.error(f"[{record_id}]   ✗ ALL STRATEGIES FAILED: Quote not found in response")
+        logger.error(f"[{record_id}]   LLM claimed quote: {repr(quote[:100])}{'...' if len(quote) > 100 else ''}")
+        logger.error(f"[{record_id}]   Response text: {repr(original_response[:200])}{'...' if len(original_response) > 200 else ''}")
+
         raise ValidationError(
             f"Evidence span {idx}: quote not found in response. "
             f"LLM claimed quote '{quote[:100]}{'...' if len(quote) > 100 else ''}' "

@@ -20,7 +20,7 @@ Edit `.env` file and add your OpenAI API key:
 
 ```bash
 OPENAI_API_KEY=sk-proj-...your-actual-key...
-MODEL_ID=gpt-4o-2024-11-20
+MODEL_ID=gpt-4o
 ```
 
 ### 3. Run Extraction
