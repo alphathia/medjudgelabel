@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# CLAUDE FILES
+CLAUDE.md
+
 # API keys and credentials
 *.key
 *.pem

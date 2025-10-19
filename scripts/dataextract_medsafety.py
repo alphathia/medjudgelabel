@@ -74,6 +74,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -841,79 +842,111 @@ class MedSafetyAnnotator:
         # Track invalid records for detailed reporting in run log
         invalid_records = []
 
+        # Flag to track if processing was interrupted
+        interrupted = False
+        last_processed_row = 0
+
+        def signal_handler(signum, frame):
+            """Handle Ctrl+C gracefully by flushing buffers and saving progress."""
+            nonlocal interrupted
+            interrupted = True
+            print(f"\n\n⚠️  Interrupted at row {last_processed_row}. Saving progress...")
+
+        # Register signal handler for graceful shutdown on Ctrl+C
+        signal.signal(signal.SIGINT, signal_handler)
+
         # Open input CSV and output files (JSONL + CSV)
         # Using context managers (with statements) ensures files are properly closed
-        with open(input_csv, newline="", encoding="utf-8") as f_in, \
-             open(annotations_jsonl, "w", encoding="utf-8") as f_jsonl, \
-             open(annotations_csv, "w", newline="", encoding="utf-8") as f_csv:
+        try:
+            with open(input_csv, newline="", encoding="utf-8") as f_in, \
+                 open(annotations_jsonl, "w", encoding="utf-8") as f_jsonl, \
+                 open(annotations_csv, "w", newline="", encoding="utf-8") as f_csv:
 
-            # Create CSV reader for input and writer for output CSV
-            reader = csv.DictReader(f_in)
-            csv_writer = csv.DictWriter(f_csv, fieldnames=csv_fieldnames)
-            csv_writer.writeheader()  # Write CSV column headers
+                # Create CSV reader for input and writer for output CSV
+                reader = csv.DictReader(f_in)
+                csv_writer = csv.DictWriter(f_csv, fieldnames=csv_fieldnames)
+                csv_writer.writeheader()  # Write CSV column headers
+                f_csv.flush()  # Flush header immediately
 
-            # Process each row sequentially
-            for idx, row in enumerate(reader, start=1):
-                # Check if we've reached the requested row limit
-                if num_rows and idx > num_rows:
-                    break
+                # Process each row sequentially
+                for idx, row in enumerate(reader, start=1):
+                    # Check for interrupt signal
+                    if interrupted:
+                        break
 
-                # Print progress indicator (end=" " keeps cursor on same line)
-                print(f"[{idx}/{num_rows if num_rows else '?'}] Processing row...", end=" ")
+                    # Check if we've reached the requested row limit
+                    if num_rows and idx > num_rows:
+                        break
 
-                # Run the complete annotation pipeline for this row
-                result = self.annotate_row(row)
+                    # Update last processed row counter for signal handler
+                    last_processed_row = idx
 
-                # Build output object with consistent structure
-                if result["status"] == "valid":
-                    # Valid annotation - add validation_status to the data
-                    output_obj = result["data"]
-                    output_obj["validation_status"] = "valid"
+                    # Print progress indicator (end=" " keeps cursor on same line)
+                    print(f"[{idx}/{num_rows if num_rows else '?'}] Processing row...", end=" ")
 
-                    # Print success message with optional HIL warning
-                    hil_msg = f" [HIL: {', '.join(result['hil_triggers'])}]" if result["hil_triggers"] else ""
-                    print(f"✓ Valid{hil_msg}")
+                    # Run the complete annotation pipeline for this row
+                    result = self.annotate_row(row)
 
-                else:
-                    # Invalid/error annotation - already has consistent structure from annotate_row()
-                    # Structure: {status, original, human_labels, query_labels:null, response_labels:null, error, raw}
-                    output_obj = {
-                        "validation_status": result["status"],  # "invalid" or "error"
-                        "original": result["original"],
-                        "human_labels": result["human_labels"],
-                        "query_labels": result.get("query_labels"),  # null
-                        "response_labels": result.get("response_labels"),  # null
-                        "error": result["error"],
-                        "raw_llm_response": result.get("raw"),
-                        "meta": {
-                            "model_id": self.model_id,
-                            "ts": int(time.time())
+                    # Build output object with consistent structure
+                    if result["status"] == "valid":
+                        # Valid annotation - add validation_status to the data
+                        output_obj = result["data"]
+                        output_obj["validation_status"] = "valid"
+
+                        # Print success message with optional HIL warning
+                        hil_msg = f" [HIL: {', '.join(result['hil_triggers'])}]" if result["hil_triggers"] else ""
+                        print(f"✓ Valid{hil_msg}")
+
+                    else:
+                        # Invalid/error annotation - already has consistent structure from annotate_row()
+                        # Structure: {status, original, human_labels, query_labels:null, response_labels:null, error, raw}
+                        output_obj = {
+                            "validation_status": result["status"],  # "invalid" or "error"
+                            "original": result["original"],
+                            "human_labels": result["human_labels"],
+                            "query_labels": result.get("query_labels"),  # null
+                            "response_labels": result.get("response_labels"),  # null
+                            "error": result["error"],
+                            "raw_llm_response": result.get("raw"),
+                            "meta": {
+                                "model_id": self.model_id,
+                                "ts": int(time.time())
+                            }
                         }
-                    }
 
-                    # Track invalid record for run log
-                    invalid_records.append({
-                        "row": idx,
-                        "id": result["original"]["id"],
-                        "error": result["error"]
-                    })
+                        # Track invalid record for run log
+                        invalid_records.append({
+                            "row": idx,
+                            "id": result["original"]["id"],
+                            "error": result["error"]
+                        })
 
-                    # Print error message (truncate to 50 chars for readability)
-                    print(f"✗ {result['status'].capitalize()}: {result['error'][:50]}...")
+                        # Print error message (truncate to 50 chars for readability)
+                        print(f"✗ {result['status'].capitalize()}: {result['error'][:50]}...")
 
-                # Write to both output formats
-                # 1. Write to JSONL (nested JSON structure)
-                f_jsonl.write(json.dumps(output_obj, ensure_ascii=False) + "\n")
+                    # Write to both output formats
+                    # 1. Write to JSONL (nested JSON structure)
+                    f_jsonl.write(json.dumps(output_obj, ensure_ascii=False) + "\n")
+                    f_jsonl.flush()  # Flush immediately to prevent data loss on crashes
 
-                # 2. Write to CSV (flattened structure)
-                csv_row = self._flatten_to_csv_row(output_obj)
-                csv_writer.writerow(csv_row)
+                    # 2. Write to CSV (flattened structure)
+                    csv_row = self._flatten_to_csv_row(output_obj)
+                    csv_writer.writerow(csv_row)
+                    f_csv.flush()  # Flush immediately to prevent data loss on crashes
 
-        # Write execution log after processing completes
-        self._write_log(log_file, input_csv, num_rows, invalid_records)
+        except KeyboardInterrupt:
+            # Graceful shutdown already handled by signal handler
+            # Files are auto-flushed and closed by context manager
+            print(f"\n✓ Progress saved. Processed {last_processed_row} rows.")
+        finally:
+            # Write execution log after processing completes (even if interrupted)
+            # Log will reflect actual rows processed (self.stats['total'])
+            self._write_log(log_file, input_csv, num_rows, invalid_records)
 
-        # Print summary statistics to console
-        self._print_summary()
+            # Print summary statistics to console
+            if interrupted:
+                print(f"\n⚠️  Run interrupted at row {last_processed_row}/{num_rows if num_rows else '?'}")
+            self._print_summary()
 
     def _write_log(self, log_file: Path, input_csv: Path, num_rows: Optional[int], invalid_records: list):
         """

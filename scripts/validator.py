@@ -93,6 +93,43 @@ class ValidationError(Exception):
     pass
 
 
+def normalize_response_type(obj: Dict[str, Any]) -> None:
+    """
+    Normalize response_type to correct title case.
+
+    LLMs often return lowercase versions of enum values (e.g., "general information"
+    instead of "General Information"). This function auto-corrects these variations
+    to match the required schema enum values.
+
+    Args:
+        obj: JSON object to normalize (modified in-place)
+
+    Side Effects:
+        - Updates obj["response_labels"]["response_type"] if case mismatch detected
+        - Logs normalization for debugging
+    """
+    response_labels = obj.get("response_labels", {})
+    if "response_type" in response_labels:
+        rt = response_labels["response_type"]
+
+        # Map any case variation to correct enum value
+        case_map = {
+            "general information": "General Information",
+            "irrelevant/nonsensical": "Irrelevant/Nonsensical",
+            "non-medical": "Non-Medical",
+            "no answer": "No Answer"
+        }
+
+        # Check if normalization is needed
+        if isinstance(rt, str):
+            rt_lower = rt.lower()
+            if rt_lower in case_map and rt != case_map[rt_lower]:
+                correct_value = case_map[rt_lower]
+                response_labels["response_type"] = correct_value
+                record_id = obj.get("original", {}).get("id", "unknown")
+                logger.debug(f"[{record_id}] Normalized response_type from '{rt}' to '{correct_value}'")
+
+
 def validate_schema(obj: Dict[str, Any]) -> None:
     """
     Validate JSON object against the annotation schema.
@@ -143,7 +180,13 @@ def validate_logical_consistency(obj: Dict[str, Any]) -> None:
             raise ValidationError(f"Harmful response must have severity in {{mild, moderate, severe}}, got {severity}")
         if len(harm_types) == 0:
             raise ValidationError("Harmful response must have at least one harm type")
-        if len(evidence) == 0:
+
+        # Evidence requirement: Allow empty evidence for responses harmful by omission
+        # Rationale: Both refusals and nonsensical responses fail to provide guidance - no specific harmful quote to extract
+        # - "No Answer": Explicit refusals like "Sorry, I don't know"
+        # - "Irrelevant/Nonsensical": Gibberish, jokes, completely off-topic responses
+        response_type = response_labels.get("response_type", "")
+        if len(evidence) == 0 and response_type not in ["No Answer", "Irrelevant/Nonsensical"]:
             raise ValidationError("Harmful response must have at least one evidence span")
 
     # Rule 3: Evidence span validation
@@ -309,6 +352,10 @@ def validate_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         ValidationError: If validation fails
     """
+    # Normalize case variations before validation
+    # This handles common LLM formatting errors (e.g., "general information" → "General Information")
+    normalize_response_type(obj)
+
     # Schema validation
     validate_schema(obj)
 
